@@ -6,7 +6,7 @@
 [![Mimari](https://img.shields.io/badge/Mimari-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64-00c853?style=for-the-badge&logo=cpu&logoColor=white)](#mimari-desteği)
 [![C++ Standardı](https://img.shields.io/badge/C++23-Saf%20Native-9c27b0?style=for-the-badge&logo=cplusplus&logoColor=white)](#derleme-gereksinimleri)
 [![Derleme](https://img.shields.io/badge/Derleme-Başarılı-43a047?style=for-the-badge&logo=githubactions&logoColor=white)](#derleme)
-[![Sürüm](https://img.shields.io/badge/Sürüm-1.0.0--2026-b71c1c?style=for-the-badge&logo=semver&logoColor=white)](#sürümler)
+[![Sürüm](https://img.shields.io/badge/Sürüm-1.0.0-b71c1c?style=for-the-badge&logo=semver&logoColor=white)](#sürümler)
 [![Lisans](https://img.shields.io/badge/Lisans-Araştırma%20Amaçlı-ff6f00?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](#lisans-ve-yasal-uyarı)
 
 **Eaquel_Redirector** — Modern Android ekosistemi için tasarlanmış,  
@@ -367,7 +367,7 @@ android {
 }
 
 dependencies {
-    implementation("io.github.eaquel.redirector:eaquel_redirector:1.0.0-2026")
+    implementation("io.github.eaquel.redirector:eaquel_redirector:1.0.0")
 }
 ```
 
@@ -611,6 +611,6 @@ Developed by **Eaquel** — 2026
 [![Android](https://img.shields.io/badge/Android-11--16-1a73e8?style=flat-square&logo=android)](https://developer.android.com)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-9c27b0?style=flat-square&logo=cplusplus)](https://en.cppreference.com)
 [![NDK](https://img.shields.io/badge/NDK-r29-00897b?style=flat-square)](https://developer.android.com/ndk)
-[![Version](https://img.shields.io/badge/1.0.0--2026-Release-b71c1c?style=flat-square)](https://github.com/Eaquel/Eaquel_Redirector/releases)
+[![Version](https://img.shields.io/badge/1.0.0-Release-b71c1c?style=flat-square)](https://github.com/Eaquel/Eaquel_Redirector/releases)
 
 </div>

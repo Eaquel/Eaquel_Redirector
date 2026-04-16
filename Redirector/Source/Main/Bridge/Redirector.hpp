@@ -1,6 +1,6 @@
 #pragma once
 
-#define EAQUEL_REDIRECTOR_VERSION "1.0.0-2026"
+#define EAQUEL_REDIRECTOR_VERSION "1.0.0"
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -137,7 +137,7 @@ enum class ErStealthLevel : uint8_t {
     register long r4 __asm__("r4") = (long)new_address;
     long scno = SYS_mremap;
     __asm__ volatile("mov r12, r7\n\tmov r7, %[sc]\n\tsvc #0\n\tmov r7, r12"
-        : "+r"(r0) : [sc]"r"(scno), "r"(r1), "r"(r2), "r"(r3), "r"(r4) : "r12", "cc", "memory");
+        : "+r"(r0) :[sc]"r"(scno), "r"(r1), "r"(r2), "r"(r3), "r"(r4) : "r12", "cc", "memory");
     result = (void*)r0;
 #elif defined(__aarch64__)
     register long x0 __asm__("x0") = (long)old_address;
@@ -293,44 +293,27 @@ struct MapInfo {
 
 using ErCleanupCallback = std::function<void()>;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 [[nodiscard]] MapInfo* redirector_scan_maps(const char* pid);
 void                   redirector_free_maps(MapInfo* maps);
+
 [[nodiscard]] bool     redirector_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
 [[nodiscard]] bool     redirector_register_hook_by_prefix(dev_t dev, ino_t inode, const char* symbol_prefix, void* callback, void** backup);
 [[nodiscard]] bool     redirector_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size, const char* symbol, void* callback, void** backup);
 [[nodiscard]] bool     redirector_register_got_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
+
 [[nodiscard]] bool     redirector_commit_hook_manual(MapInfo* maps);
 [[nodiscard]] bool     redirector_commit_hook();
 [[nodiscard]] bool     redirector_unhook(dev_t dev, ino_t inode, const char* symbol);
+
 [[nodiscard]] bool     er_set_stealth_level(ErStealthLevel level);
 [[nodiscard]] bool     invalidate_backups();
 void                   redirector_free_resources();
 void                   er_set_cleanup_callback(ErCleanupCallback cb);
 [[nodiscard]] bool     er_init_for_zygisk();
-
-// ==================== RUST SUBMODULE İÇİN C LINKAGE ====================
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Mevcut public API'lerini buraya yaz (hepsini kopyala-yapıştır yap)
-MapInfo* redirector_scan_maps(const char* pid);
-void     redirector_free_maps(MapInfo* maps);
-
-bool redirector_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
-bool redirector_register_hook_by_prefix(dev_t dev, ino_t inode, const char* symbol_prefix, void* callback, void** backup);
-bool redirector_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size, const char* symbol, void* callback, void** backup);
-bool redirector_register_got_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
-
-bool redirector_commit_hook_manual(MapInfo* maps);
-bool redirector_commit_hook();
-bool redirector_unhook(dev_t dev, ino_t inode, const char* symbol);
-
-bool er_set_stealth_level(ErStealthLevel level);
-bool invalidate_backups();
-void redirector_free_resources();
-void er_set_cleanup_callback(ErCleanupCallback cb);
-bool er_init_for_zygisk();
 
 #ifdef __cplusplus
 }
