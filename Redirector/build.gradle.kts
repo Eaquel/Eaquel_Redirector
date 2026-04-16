@@ -84,6 +84,12 @@ android {
                 }
             }
         }
+        debug {
+            // Debug build devre dışı — CI sadece release/standalone üretir
+            isDefault = false
+            enableUnitTestCoverage = false
+            enableAndroidTestCoverage = false
+        }
         release {
             isMinifyEnabled = false
             externalNativeBuild {

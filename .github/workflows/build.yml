@@ -44,11 +44,11 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x gradlew
 
-      - name: Build Debug & Release (AAR)
+      - name: Build Release (AAR)
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
-          ./gradlew :Redirector:assembleDebug :Redirector:assembleRelease --no-daemon -PdisableLogs=true
+          ./gradlew :Redirector:assembleRelease --no-daemon -PdisableLogs=true
 
       - name: Upload Compiled Artifacts (AAR)
         uses: actions/upload-artifact@v4

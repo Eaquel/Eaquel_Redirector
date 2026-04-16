@@ -1,6 +1,3 @@
-// -----------------------------------------------------------------------
-// Root build.gradle.kts — Eaquel_Redirector
-// -----------------------------------------------------------------------
 val androidTargetSdkVersion  by extra(36)
 val androidMinSdkVersion     by extra(30)
 val androidBuildToolsVersion by extra("36.0.0")
