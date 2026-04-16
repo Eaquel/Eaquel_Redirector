@@ -1,18 +1,21 @@
-cmake_minimum_required(VERSION 3.22.1)
-project(lsplt LANGUAGES CXX)
+cmake_minimum_required(VERSION 4.0.0)
+project(Redirector LANGUAGES CXX)
+
 
 find_program(CCACHE ccache)
 if(CCACHE)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE})
 endif()
 
-set(SOURCES lsplt.cpp)
+# Kaynak dosya: Redirector.cpp (lsplt.cpp değil)
+set(SOURCES Redirector.cpp)
 
-option(LSPLT_BUILD_SHARED "Build lsplt as shared library" ON)
+option(REDIRECTOR_BUILD_SHARED "Build Redirector as shared library" ON)
 
-if(LSPLT_BUILD_SHARED)
+if(REDIRECTOR_BUILD_SHARED)
     add_library(${PROJECT_NAME} SHARED ${SOURCES})
-    target_include_directories(${PROJECT_NAME} PUBLIC include)
+    # Prefab header dizini: Bridge/ (include/ değil)
+    target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_23)
     target_compile_options(${PROJECT_NAME} PRIVATE -flto)
     target_link_options(${PROJECT_NAME} PRIVATE -flto)
@@ -30,7 +33,8 @@ if(LSPLT_BUILD_SHARED)
     )
 endif()
 
+# Static varyant
 add_library(${PROJECT_NAME}_static STATIC ${SOURCES})
-target_include_directories(${PROJECT_NAME}_static PUBLIC include)
+target_include_directories(${PROJECT_NAME}_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${PROJECT_NAME}_static PUBLIC cxx_std_23)
 target_link_libraries(${PROJECT_NAME}_static PUBLIC log)

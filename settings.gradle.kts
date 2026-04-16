@@ -5,8 +5,7 @@ pluginManagement {
         mavenCentral()
     }
     plugins {
-        id("com.android.application") version "8.9.0"
-        id("com.android.library")     version "8.9.0"
+        id("com.android.library") version "9.1.1"
     }
 }
 
@@ -15,11 +14,15 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        mavenLocal()
+    }
+    versionCatalogs {
+        create("libs") {
+            from(files("Gradle/libs.versions.toml"))
+        }
     }
 }
 
 rootProject.name = "Eaquel_Redirector"
 
-include(
-    ":Redirector",
-)
+include(":Redirector")

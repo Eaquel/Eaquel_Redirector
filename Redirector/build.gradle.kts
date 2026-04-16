@@ -1,44 +1,33 @@
-import java.nio.file.Paths
-import org.eclipse.jgit.api.Git
-import org.eclipse.jgit.storage.file.FileRepositoryBuilder
-
 plugins {
     id("com.android.library")
     id("maven-publish")
     id("signing")
 }
 
-buildscript {
-    repositories { mavenCentral() }
-    dependencies { classpath("org.eclipse.jgit:org.eclipse.jgit:7.1.0.202411261347-r") }
-}
-
-val androidTargetSdkVersion: Int by rootProject.extra
-val androidMinSdkVersion: Int by rootProject.extra
-val androidBuildToolsVersion: String by rootProject.extra
-val androidCompileSdkVersion: Int by rootProject.extra
-val androidNdkVersion: String by rootProject.extra
-val androidCmakeVersion: String by rootProject.extra
-
-fun findInPath(executable: String): String? {
-    val pathEnv = System.getenv("PATH") ?: return null
-    return pathEnv.split(File.pathSeparator)
-        .map {
-            Paths.get("$it${File.separator}$executable${if (org.gradle.internal.os.OperatingSystem.current().isWindows) ".exe" else ""}").toFile()
-        }
-        .firstOrNull { it.exists() }?.absolutePath
-}
+val androidTargetSdkVersion  : Int    by rootProject.extra
+val androidMinSdkVersion     : Int    by rootProject.extra
+val androidBuildToolsVersion : String by rootProject.extra
+val androidCompileSdkVersion : Int    by rootProject.extra
+val androidNdkVersion        : String by rootProject.extra
+val androidCmakeVersion      : String by rootProject.extra
 
 android {
-    compileSdk = androidCompileSdkVersion
-    ndkVersion = androidNdkVersion
+    compileSdk       = androidCompileSdkVersion
+    ndkVersion       = androidNdkVersion
     buildToolsVersion = androidBuildToolsVersion
+    namespace        = "com.eaquel.redirector"
+
+    sourceSets {
+        getByName("main") {
+            manifest.srcFile("Source/Main/AndroidManifest.xml")
+        }
+    }
 
     buildFeatures {
-        buildConfig = false
-        prefabPublishing = true
-        androidResources = false
-        prefab = true
+        buildConfig        = false
+        prefabPublishing   = true
+        androidResources   = false
+        prefab             = true
     }
 
     packaging {
@@ -46,19 +35,19 @@ android {
     }
 
     prefab {
-        register("lsplt") {
-            headers = "src/main/jni/include"
+        register("Redirector") {
+            headers = "Source/Main/Bridge"
         }
     }
 
     defaultConfig {
-        minSdk = androidMinSdkVersion
+        minSdk    = androidMinSdkVersion
         targetSdk = androidTargetSdkVersion
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 
     buildTypes {
@@ -76,9 +65,10 @@ android {
                     )
                     cppFlags("-std=c++23", *flags)
                     val configFlags = arrayOf("-Oz", "-DNDEBUG").joinToString(" ")
+                    val buildDir = layout.buildDirectory.get().asFile.absolutePath
                     arguments(
                         "-DCMAKE_CXX_FLAGS_RELEASE=$configFlags",
-                        "-DDEBUG_SYMBOLS_PATH=${project.buildDir.absolutePath}/symbols/$name",
+                        "-DDEBUG_SYMBOLS_PATH=$buildDir/symbols/$name",
                         "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
                     )
                 }
@@ -117,18 +107,16 @@ android {
     }
 
     lint {
-        abortOnError = true
-        checkReleaseBuilds = false
+        abortOnError         = true
+        checkReleaseBuilds   = false
     }
 
     externalNativeBuild {
         cmake {
-            path = file("src/main/jni/CMakeLists.txt")
+            path    = file("Source/Main/Bridge/CMakeLists.txt")
             version = androidCmakeVersion
         }
     }
-
-    namespace = "io.github.eaquel.redirector.lsplt"
 
     publishing {
         singleVariant("release")    { withSourcesJar(); withJavadocJar() }
@@ -136,63 +124,87 @@ android {
     }
 }
 
+val buildDir = layout.buildDirectory.get().asFile.absolutePath
+
 val symbolsReleaseTask = tasks.register<Jar>("generateReleaseSymbolsJar") {
-    from("${project.buildDir.absolutePath}/symbols/release")
+    from("$buildDir/symbols/release")
     exclude("**/dex_builder")
     archiveClassifier.set("symbols")
     archiveBaseName.set("release")
 }
 
 val symbolsStandaloneTask = tasks.register<Jar>("generateStandaloneSymbolsJar") {
-    from("${project.buildDir.absolutePath}/symbols/standalone")
+    from("$buildDir/symbols/standalone")
     exclude("**/dex_builder")
     archiveClassifier.set("symbols")
     archiveBaseName.set("standalone")
 }
 
-val ver = FileRepositoryBuilder().findGitDir(rootProject.file(".git")).runCatching {
-    build().use { Git(it).describe().setTags(true).setAbbrev(0).call().removePrefix("v") }
-}.getOrNull() ?: "0.0"
+val ver: String = runCatching {
+    val proc = ProcessBuilder("git", "describe", "--tags", "--abbrev=0")
+        .directory(rootProject.projectDir)
+        .redirectErrorStream(true)
+        .start()
+    proc.inputStream.bufferedReader().readText().trim().removePrefix("v")
+        .takeIf { it.isNotBlank() } ?: "0.0"
+}.getOrDefault("0.0")
 
 publishing {
     publications {
         fun MavenPublication.setup() {
-            group = "io.github.eaquel.redirector"
+            group   = "io.github.eaquel.redirector"
             version = ver
             pom {
-                name.set("lsplt")
+                name.set("Eaquel_Redirector")
                 description.set("PLT hook framework — Eaquel/Eaquel_Redirector")
                 url.set("https://github.com/Eaquel/Eaquel_Redirector")
+                licenses {
+                    license {
+                        name.set("Apache-2.0")
+                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                    }
+                }
                 developers {
                     developer { name.set("Eaquel"); email.set("shakeofangel@gmail.com") }
                 }
+                scm {
+                    connection.set("scm:git:git://github.com/Eaquel/Eaquel_Redirector.git")
+                    url.set("https://github.com/Eaquel/Eaquel_Redirector")
+                }
             }
         }
-        register<MavenPublication>("lsplt") {
-            artifactId = "lsplt"
-            afterEvaluate { from(components.getByName("release")); artifact(symbolsReleaseTask) }
+        register<MavenPublication>("Redirector") {
+            artifactId = "Redirector"
+            afterEvaluate {
+                from(components.getByName("release"))
+                artifact(symbolsReleaseTask)
+            }
             setup()
         }
-        register<MavenPublication>("lspltStandalone") {
-            artifactId = "lsplt-standalone"
-            afterEvaluate { from(components.getByName("standalone")); artifact(symbolsStandaloneTask) }
+        register<MavenPublication>("RedirectorStandalone") {
+            artifactId = "Redirector-standalone"
+            afterEvaluate {
+                from(components.getByName("standalone"))
+                artifact(symbolsStandaloneTask)
+            }
             setup()
         }
     }
     repositories {
         maven {
             name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/Eaquel/Eaquel_Redirector")
+            url  = uri("https://maven.pkg.github.com/Eaquel/Eaquel_Redirector")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")
             }
         }
+        mavenLocal()
     }
 }
 
 signing {
-    val signingKey = findProperty("signingKey") as String?
+    val signingKey      = findProperty("signingKey")      as String?
     val signingPassword = findProperty("signingPassword") as String?
     if (signingKey != null && signingPassword != null) {
         useInMemoryPgpKeys(signingKey, signingPassword)

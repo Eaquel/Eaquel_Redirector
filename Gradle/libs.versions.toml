@@ -1,16 +1,13 @@
 [versions]
-agp            = "9.1.0"
-ndk            = "29.0.14206865"
-cmake          = "3.22.1+"
-buildTools     = "36.0.0"
-compileSdk     = "36"
-minSdk         = "30"
-targetSdk      = "36"
-jgit           = "7.1.0.202411261347-r"
+agp          = "9.1.1"
+ndk          = "29.0.14206865"
+cmake        = "4.1.0+"
+buildTools   = "36.0.0"
+compileSdk   = "36"
+minSdk       = "30"
+targetSdk    = "36"
 
 [libraries]
-jgit = { module = "org.eclipse.jgit:org.eclipse.jgit", version.ref = "jgit" }
 
 [plugins]
-android-library     = { id = "com.android.library",     version.ref = "agp" }
-android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
