@@ -2,7 +2,6 @@ plugins {
     id("com.android.library")
 }
 
-val androidTargetSdkVersion  : Int    by rootProject.extra
 val androidMinSdkVersion     : Int    by rootProject.extra
 val androidBuildToolsVersion : String by rootProject.extra
 val androidCompileSdkVersion : Int    by rootProject.extra
@@ -24,8 +23,11 @@ android {
     buildFeatures {
         buildConfig      = false
         prefabPublishing = true
-        androidResources = false
         prefab           = true
+    }
+
+    androidResources {
+        enable = false
     }
 
     packaging {
@@ -39,8 +41,7 @@ android {
     }
 
     defaultConfig {
-        minSdk    = androidMinSdkVersion
-        targetSdk = androidTargetSdkVersion
+        minSdk = androidMinSdkVersion
     }
 
     compileOptions {

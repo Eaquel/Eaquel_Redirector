@@ -14,12 +14,6 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        mavenLocal()
-    }
-    versionCatalogs {
-        create("libs") {
-            from(files("Gradle/libs.versions.toml"))
-        }
     }
 }
 
