@@ -307,3 +307,31 @@ void                   redirector_free_maps(MapInfo* maps);
 void                   redirector_free_resources();
 void                   er_set_cleanup_callback(ErCleanupCallback cb);
 [[nodiscard]] bool     er_init_for_zygisk();
+
+// ==================== RUST SUBMODULE İÇİN C LINKAGE ====================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Mevcut public API'lerini buraya yaz (hepsini kopyala-yapıştır yap)
+MapInfo* redirector_scan_maps(const char* pid);
+void     redirector_free_maps(MapInfo* maps);
+
+bool redirector_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
+bool redirector_register_hook_by_prefix(dev_t dev, ino_t inode, const char* symbol_prefix, void* callback, void** backup);
+bool redirector_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size, const char* symbol, void* callback, void** backup);
+bool redirector_register_got_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
+
+bool redirector_commit_hook_manual(MapInfo* maps);
+bool redirector_commit_hook();
+bool redirector_unhook(dev_t dev, ino_t inode, const char* symbol);
+
+bool er_set_stealth_level(ErStealthLevel level);
+bool invalidate_backups();
+void redirector_free_resources();
+void er_set_cleanup_callback(ErCleanupCallback cb);
+bool er_init_for_zygisk();
+
+#ifdef __cplusplus
+}
+#endif
