@@ -1,4 +1,4 @@
-name: Build
+name: Eaquel_Redirector CI/CD
 
 on:
   push:
@@ -13,49 +13,53 @@ permissions:
 
 jobs:
   build:
-    name: Build & Package
+    name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest]
 
     steps:
-      - name: Check out
+      - name: Check out Repository
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
           fetch-depth: 0
 
-      - name: Set up JDK 21
+      - name: Set Up Java 21 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
           cache: 'gradle'
 
-      - name: ccache
+      - name: Setup Compiler Cache (CCache)
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ runner.os }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}
+          key: ${{ runner.os }}-ndk-${{ hashFiles('**/CMakeLists.txt', '**/*.cpp') }}
+          restore-keys: ${{ runner.os }}-ndk-
 
-      - name: Grant execute permission for gradlew
+      - name: Grant Gradle Execute Permission
         if: runner.os != 'Windows'
         run: chmod +x gradlew
 
-      - name: Build with Gradle
+      - name: Build Debug & Release (AAR)
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
-          ccache -o cache_dir=${{ github.workspace }}/.ccache
-          ccache -o hash_dir=false
-          ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
-          ccache -p
-          echo 'android.native.buildOutput=verbose' >> gradle.properties
-          ./gradlew :Redirector:assembleDebug :Redirector:assembleRelease
+          ./gradlew :Redirector:assembleDebug :Redirector:assembleRelease --no-daemon -PdisableLogs=true
 
-      - name: Upload AAR Artifacts
+      - name: Upload Compiled Artifacts (AAR)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}-binaries
-          path: Redirector/build/outputs/aar/
+          name: eaquel-redirector-${{ matrix.os }}-aar
+          path: Redirector/build/outputs/aar/*.aar
           if-no-files-found: error
+
+      - name: Upload Debug Symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: eaquel-redirector-${{ matrix.os }}-symbols
+          path: Redirector/build/symbols/**
+          if-no-files-found: ignore

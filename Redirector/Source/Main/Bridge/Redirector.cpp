@@ -4,7 +4,6 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +11,12 @@
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <mutex>
+#include <atomic>
+#include <unordered_map>
+#include <string>
+#include <optional>
+#include <functional>
 
 #if defined(__arm__)
 #define ELF_R_GENERIC_JUMP_SLOT R_ARM_JUMP_SLOT
@@ -44,6 +49,27 @@
 #define ELF_R_INFO(sym, type)  ELF32_R_INFO(sym, type)
 #define ELF_R_TYPE(info)       ELF32_R_TYPE(info)
 #endif
+
+static std::mutex                       g_mutex;
+static ErStealthLevel                   g_stealth_level = ErStealthLevel::DIRECT_PATCH;
+static std::atomic<bool>                g_zygisk_mode{false};
+static ErCleanupCallback                g_cleanup_cb;
+
+struct SymbolCacheKey {
+    std::string name;
+    uintptr_t   base;
+    bool operator==(const SymbolCacheKey& o) const { return base == o.base && name == o.name; }
+};
+
+struct SymbolCacheKeyHash {
+    size_t operator()(const SymbolCacheKey& k) const {
+        size_t h1 = std::hash<std::string>{}(k.name);
+        size_t h2 = std::hash<uintptr_t>{}(k.base);
+        return h1 ^ (h2 << 32) ^ (h2 >> 32);
+    }
+};
+
+static std::unordered_map<SymbolCacheKey, uint32_t, SymbolCacheKeyHash> g_sym_cache;
 
 struct Sleb128Decoder {
     const uint8_t* current;
@@ -112,6 +138,7 @@ void elfutil_init(ElfInfo* elf, uintptr_t base_addr) {
 
     elf->program_header_ = (ElfW(Phdr)*)elf_offset(elf->header_, elf->header_->e_phoff);
     uintptr_t ph_off = (uintptr_t)elf->program_header_;
+    bool has_relro = false;
     for (int i = 0; i < elf->header_->e_phnum; i++, ph_off += elf->header_->e_phentsize) {
         ElfW(Phdr)* ph = (ElfW(Phdr)*)ph_off;
         if (ph->p_type == PT_LOAD && ph->p_offset == 0) {
@@ -120,8 +147,11 @@ void elfutil_init(ElfInfo* elf, uintptr_t base_addr) {
         } else if (ph->p_type == PT_DYNAMIC) {
             elf->dynamic_      = (ElfW(Dyn)*)ph->p_vaddr;
             elf->dynamic_size_ = ph->p_memsz;
+        } else if (ph->p_type == PT_GNU_RELRO) {
+            has_relro = true;
         }
     }
+    elf->relro_active_ = has_relro;
     if (!elf->dynamic_ || !elf->bias_addr_) return;
     elf->dynamic_ = (ElfW(Dyn)*)(elf->bias_addr_ + (uintptr_t)elf->dynamic_);
 
@@ -140,6 +170,15 @@ void elfutil_init(ElfInfo* elf, uintptr_t base_addr) {
             case DT_ANDROID_REL:  if (!elf_set_ptr(&elf->rel_android_, elf->base_addr_, elf->bias_addr_, d->d_un.d_ptr)) return; elf->rel_android_is_rela_ = false; break;
             case DT_ANDROID_RELA: if (!elf_set_ptr(&elf->rel_android_, elf->base_addr_, elf->bias_addr_, d->d_un.d_ptr)) return; elf->rel_android_is_rela_ = true;  break;
             case DT_ANDROID_RELSZ: case DT_ANDROID_RELASZ: elf->rel_android_size_ = d->d_un.d_val; break;
+            case DT_RELR: case 0x6fffe000: {
+                ElfW(Addr) relr_addr = 0;
+                if (elf_set_ptr(&relr_addr, elf->base_addr_, elf->bias_addr_, d->d_un.d_ptr)) {
+                    elf->relr_ = relr_addr;
+                }
+                break;
+            }
+            case DT_RELRSZ: case 0x6fffe001: elf->relr_size_ = d->d_un.d_val; break;
+            case DT_RELRENT: case 0x6fffe003: elf->relr_entry_size_ = d->d_un.d_val; break;
             case DT_HASH: {
                 if (elf->bloom_) continue;
                 ElfW(Word)* raw    = (ElfW(Word)*)(elf->bias_addr_ + d->d_un.d_ptr);
@@ -161,6 +200,13 @@ void elfutil_init(ElfInfo* elf, uintptr_t base_addr) {
             }
             default: break;
         }
+    }
+    if (elf->relr_ && elf->relr_size_ && elf->relr_entry_size_) {
+        size_t count = elf->relr_size_ / elf->relr_entry_size_;
+        elf->relr_entries = std::span<const ElfW(Addr)>(
+            reinterpret_cast<const ElfW(Addr)*>(elf->relr_),
+            count
+        );
     }
     if (elf->rel_android_) {
         const char* rel = (const char*)elf->rel_android_;
@@ -233,13 +279,52 @@ static bool elfutil_unpack_android_relocs(const ElfInfo* elf, AndroidRelocBuffer
     return true;
 }
 
-static uint32_t gnu_lookup(const ElfInfo* elf, const char* name) {
+static void er_relr_looper(const ElfInfo* elf, uintptr_t** out, size_t* cnt) {
+    if (elf->relr_entries.empty()) return;
+    ElfW(Addr) base = 0;
+    bool first = true;
+    for (size_t i = 0; i < elf->relr_entries.size(); ++i) {
+        ElfW(Addr) entry = elf->relr_entries[i];
+        if ((entry & 1) == 0) {
+            if (first) {
+                base  = elf->bias_addr_ + entry;
+                first = false;
+                uintptr_t addr = base;
+                if (addr > elf->base_addr_) {
+                    uintptr_t* tmp = (uintptr_t*)realloc(*out, (*cnt + 1) * sizeof(uintptr_t));
+                    if (tmp) { *out = tmp; (*out)[(*cnt)++] = addr; }
+                }
+            } else {
+                base += entry;
+            }
+            continue;
+        }
+        for (int bit = 1; bit < (int)(sizeof(ElfW(Addr)) * 8); ++bit) {
+            if (entry & ((ElfW(Addr))1 << bit)) {
+                uintptr_t addr = base + (uintptr_t)(bit - 1) * sizeof(ElfW(Addr));
+                if (addr > elf->base_addr_) {
+                    uintptr_t* tmp = (uintptr_t*)realloc(*out, (*cnt + 1) * sizeof(uintptr_t));
+                    if (tmp) { *out = tmp; (*out)[(*cnt)++] = addr; }
+                }
+            }
+        }
+        base += (sizeof(ElfW(Addr)) * 8 - 1) * sizeof(ElfW(Addr));
+    }
+}
+
+static uint32_t gnu_lookup_cached(const ElfInfo* elf, std::string_view name) {
+    SymbolCacheKey key{ std::string(name), elf->base_addr_ };
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_sym_cache.find(key);
+        if (it != g_sym_cache.end()) return it->second;
+    }
     static const uint32_t kBits  = sizeof(ElfW(Addr)) * 8;
     static const uint32_t kInit  = 5381;
     static const uint32_t kShift = 5;
     if (!elf->bucket_ || !elf->bucket_count_ || !elf->bloom_ || !elf->bloom_size_) return 0;
     uint32_t hash = kInit;
-    for (int i = 0; name[i]; i++) hash += (hash << kShift) + name[i];
+    for (char c : name) hash += (hash << kShift) + (uint8_t)c;
     uint32_t    bi       = (hash / kBits) % elf->bloom_size_;
     ElfW(Addr)  bword    = elf->bloom_[bi];
     uintptr_t   bit_lo   = (uintptr_t)1 << (hash % kBits);
@@ -249,10 +334,18 @@ static uint32_t gnu_lookup(const ElfInfo* elf, const char* name) {
     if (idx < elf->sym_offset_) return 0;
     for (;; idx++) {
         ElfW(Sym)* sym = elf->dyn_sym_ + idx;
-        if (((elf->chain_[idx] ^ hash) >> 1) == 0 && strcmp(name, elf->dyn_str_ + sym->st_name) == 0) return idx;
+        if (((elf->chain_[idx] ^ hash) >> 1) == 0 && name == std::string_view(elf->dyn_str_ + sym->st_name)) {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_sym_cache[key] = idx;
+            return idx;
+        }
         if (elf->chain_[idx] & 1) break;
     }
     return 0;
+}
+
+static uint32_t gnu_lookup(const ElfInfo* elf, const char* name) {
+    return gnu_lookup_cached(elf, name);
 }
 
 static uint32_t elf_lookup(const ElfInfo* elf, const char* name) {
@@ -316,6 +409,7 @@ size_t elfutil_find_plt_addr(const ElfInfo* elf, const char* name, uintptr_t** o
         looper(elf, idx, abuf.data, abuf.size, elf->rel_android_is_rela_, false, out, &cnt);
         free(abuf.data);
     }
+    er_relr_looper(elf, out, &cnt);
     return cnt;
 }
 
@@ -367,6 +461,7 @@ struct RegisterInfo {
     uintptr_t offset_end;
     char*     symbol;
     bool      is_prefix;
+    bool      is_got;
     void*     callback;
     void**    backup;
 };
@@ -385,23 +480,26 @@ struct HookInfo {
     bool       self;
 };
 
-static pthread_mutex_t  g_mutex        = PTHREAD_MUTEX_INITIALIZER;
 static RegisterInfo*    g_regs         = nullptr;
 static size_t           g_regs_len     = 0;
 static HookInfo*        g_hooks        = nullptr;
 static size_t           g_hooks_len    = 0;
 
-static inline char* page_start(uintptr_t addr) {
+static inline uintptr_t page_start_addr(uintptr_t addr) {
     if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
-    return (char*)(addr / k_page_size * k_page_size);
+    return addr & ~(k_page_size - 1);
+}
+
+static inline char* page_start(uintptr_t addr) {
+    return (char*)page_start_addr(addr);
 }
 
 static inline char* page_end(uintptr_t addr) {
     if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
-    return (char*)((addr / k_page_size * k_page_size) + k_page_size);
+    return (char*)(page_start_addr(addr) + k_page_size);
 }
 
-static inline void* lsplt_memcpy(void* dst, const void* src, size_t n) {
+static inline void* redirector_memcpy(void* dst, const void* src, size_t n) {
     unsigned char* d = (unsigned char*)dst;
     const unsigned char* s = (const unsigned char*)src;
     while (n--) *d++ = *s++;
@@ -412,7 +510,7 @@ static inline void* lsplt_memcpy(void* dst, const void* src, size_t n) {
 static inline uintptr_t align_up(uintptr_t v, uintptr_t a) { return (v + a - 1) & ~(a - 1); }
 
 static void* find_backup_hint(size_t needed) {
-    MapInfo* maps = lsplt_scan_maps("self");
+    MapInfo* maps = redirector_scan_maps("self");
     if (!maps) return nullptr;
     if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
     needed = (size_t)align_up((uintptr_t)needed, k_page_size);
@@ -425,7 +523,7 @@ static void* find_backup_hint(size_t needed) {
         if (self_addr < m->start || self_addr >= m->end) continue;
         self_end = m->end; self_idx = i; break;
     }
-    if (self_idx == maps->length) { LOGE("self mapping not found"); lsplt_free_maps(maps); return nullptr; }
+    if (self_idx == maps->length) { LOGE("self mapping not found"); redirector_free_maps(maps); return nullptr; }
     for (size_t i = self_idx + 1; i < maps->length; i++) {
         MapEntry* m = &maps->maps[i];
         if (m->start > align_up(self_end, k_page_size)) break;
@@ -439,7 +537,7 @@ static void* find_backup_hint(size_t needed) {
         if (m->start > gap_start && needed <= m->start - gap_start) hint = gap_start;
         prev_end = m->end;
     }
-    lsplt_free_maps(maps);
+    redirector_free_maps(maps);
     return (void*)hint;
 }
 #endif
@@ -496,10 +594,19 @@ static int recv_fd(int sock) {
     return fd;
 }
 
-MapInfo* lsplt_scan_maps(const char* pid) {
+static bool er_is_linker_namespace_map(const char* path) {
+    if (!path) return false;
+    if (strstr(path, "/apex/com.android.runtime")) return true;
+    if (strstr(path, "/apex/com.android.art"))     return true;
+    if (strncmp(path, "[anon:linker_alloc", 18) == 0) return true;
+    if (strncmp(path, "[anon:scudo",       11) == 0) return true;
+    return false;
+}
+
+MapInfo* redirector_scan_maps(const char* pid) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { LOGE("socketpair fail"); return nullptr; }
-    int child = (int)syscall(SYS_clone, SIGCHLD, 0);
+    long child = er_syscall<SYS_clone>(SIGCHLD, 0);
     if (child == -1) { LOGE("clone fail"); close(sv[0]); close(sv[1]); return nullptr; }
     if (child == 0) {
         close(sv[0]);
@@ -518,15 +625,15 @@ MapInfo* lsplt_scan_maps(const char* pid) {
     }
     close(sv[1]);
     int fd = recv_fd(sv[0]);
-    if (fd < 0) { close(sv[0]); waitpid(child, nullptr, 0); return nullptr; }
+    if (fd < 0) { close(sv[0]); waitpid((pid_t)child, nullptr, 0); return nullptr; }
     FILE* fp = fdopen(fd, "r");
-    if (!fp) { close(fd); close(sv[0]); waitpid(child, nullptr, 0); return nullptr; }
+    if (!fp) { close(fd); close(sv[0]); waitpid((pid_t)child, nullptr, 0); return nullptr; }
 
     MapInfo* info = (MapInfo*)calloc(1, sizeof(MapInfo));
-    if (!info) { fclose(fp); close(sv[0]); waitpid(child, nullptr, 0); return nullptr; }
+    if (!info) { fclose(fp); close(sv[0]); waitpid((pid_t)child, nullptr, 0); return nullptr; }
     size_t cap = 2;
     info->maps = (MapEntry*)malloc(cap * sizeof(MapEntry));
-    if (!info->maps) { free(info); fclose(fp); close(sv[0]); waitpid(child, nullptr, 0); return nullptr; }
+    if (!info->maps) { free(info); fclose(fp); close(sv[0]); waitpid((pid_t)child, nullptr, 0); return nullptr; }
 
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
@@ -544,7 +651,9 @@ MapInfo* lsplt_scan_maps(const char* pid) {
         if (perms[1] == 'w') pb |= PROT_WRITE;
         if (perms[2] == 'x') pb |= PROT_EXEC;
         while (isspace((unsigned char)line[path_off])) path_off++;
-        char* pstr = strdup(line + path_off);
+        const char* raw_path = line + path_off;
+        if (er_is_linker_namespace_map(raw_path)) continue;
+        char* pstr = strdup(raw_path);
         if (!pstr) goto cleanup;
         if (info->length >= cap) {
             cap *= 2;
@@ -556,7 +665,7 @@ MapInfo* lsplt_scan_maps(const char* pid) {
         continue;
     cleanup:
         for (size_t i = 0; i < info->length; i++) free(info->maps[i].path);
-        free(info->maps); free(info); fclose(fp); close(sv[0]); waitpid(child, nullptr, 0);
+        free(info->maps); free(info); fclose(fp); close(sv[0]); waitpid((pid_t)child, nullptr, 0);
         return nullptr;
     }
     fclose(fp);
@@ -565,11 +674,11 @@ MapInfo* lsplt_scan_maps(const char* pid) {
     close(sv[0]);
     MapEntry* tmp = (MapEntry*)realloc(info->maps, info->length * sizeof(MapEntry));
     if (tmp) info->maps = tmp;
-    waitpid(child, nullptr, 0);
+    waitpid((pid_t)child, nullptr, 0);
     return info;
 }
 
-void lsplt_free_maps(MapInfo* maps) {
+void redirector_free_maps(MapInfo* maps) {
     if (!maps) return;
     for (size_t i = 0; i < maps->length; i++) free(maps->maps[i].path);
     free(maps->maps); free(maps);
@@ -674,60 +783,69 @@ static bool merge_hook_infos(HookInfo** new_arr, size_t* new_len, HookInfo* old_
     return true;
 }
 
-static bool do_hooks_for_all(HookInfo* hooks, size_t hooks_len) {
-    bool         ok       = true;
-    SymAddrBatch* batches = nullptr;
-    size_t        batches_len = 0;
-
-    for (size_t i = 0; i < hooks_len; i++) {
-        HookInfo* h = &hooks[i];
-        for (size_t j = 0; j < g_regs_len; j++) {
-            RegisterInfo* reg = &g_regs[j];
-            if (!reg->symbol) continue;
-            if (h->map.offset != reg->offset_start || !hook_info_matches(h, reg)) continue;
-
-            bool restore = false;
-            if (g_hooks) for (size_t k = 0; k < g_hooks_len; k++) {
-                for (size_t l = 0; l < g_hooks[k].entries_len; l++) {
-                    if (g_hooks[k].entries[l].backup == (uintptr_t)reg->callback) {
-                        restore = true;
-                        ok = do_hook_addr(hooks, hooks_len, g_hooks[k].entries[l].addr, g_hooks[k].entries[l].backup, nullptr) && ok;
-                        break;
-                    }
+static void er_stealth_direct_patch(uintptr_t addr, uintptr_t cb, uintptr_t* out_orig) {
+    if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
+    uintptr_t page = addr & ~(k_page_size - 1);
+    int cur_prot = PROT_READ;
+    {
+        MapInfo* maps = redirector_scan_maps("self");
+        if (maps) {
+            for (size_t i = 0; i < maps->length; i++) {
+                if (maps->maps[i].start <= addr && addr < maps->maps[i].end) {
+                    cur_prot = maps->maps[i].perms;
+                    break;
                 }
             }
-
-            if (!h->elf.base_addr_ && !restore) elfutil_init(&h->elf, h->map.start);
-            if (h->elf.valid_ && !restore) {
-                uintptr_t* addrs = nullptr;
-                size_t     addrs_len;
-                if (!reg->is_prefix) addrs_len = elfutil_find_plt_addr(&h->elf, reg->symbol, &addrs);
-                else                 addrs_len = elfutil_find_plt_addr_by_prefix(&h->elf, reg->symbol, &addrs);
-                if (!addrs_len) {
-                    LOGE("PLT addr not found: %s in %s", reg->symbol, h->map.path);
-                    ok = false; free(addrs); free(reg->symbol); reg->symbol = nullptr;
-                    goto next_reg;
-                }
-                SymAddrBatch* tmp = (SymAddrBatch*)realloc(batches, (batches_len + 1) * sizeof(SymAddrBatch));
-                if (!tmp) { PLOGE("realloc batches"); ok = false; free(addrs); free(reg->symbol); reg->symbol = nullptr; goto next_reg; }
-                batches = tmp;
-                batches[batches_len++] = { (void**)addrs, addrs_len, reg->callback, reg->backup };
-            }
-            free(reg->symbol); reg->symbol = nullptr;
-            continue;
-        next_reg:;
+            redirector_free_maps(maps);
         }
     }
+    mprotect((void*)page, k_page_size, PROT_READ | PROT_WRITE);
+    uintptr_t orig = *(uintptr_t*)addr;
+    if (out_orig) *out_orig = orig;
+    *(uintptr_t*)addr = cb;
+#if defined(__aarch64__)
+    __asm__ volatile(
+        "dc cvau, %0\n\t"
+        "dsb ish\n\t"
+        "ic ivau, %0\n\t"
+        "dsb ish\n\t"
+        "isb"
+        :: "r"(addr) : "memory"
+    );
+#elif defined(__arm__)
+    __builtin___clear_cache((void*)page, (void*)(page + k_page_size));
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("" ::: "memory");
+#elif defined(__riscv)
+    __asm__ volatile("fence.i" ::: "memory");
+#else
+    __builtin___clear_cache((void*)page, (void*)(page + k_page_size));
+#endif
+    int restore_prot = cur_prot & ~PROT_WRITE;
+    if (restore_prot == 0) restore_prot = PROT_READ;
+    mprotect((void*)page, k_page_size, restore_prot);
+}
 
-    if (ok) for (size_t i = 0; i < batches_len; i++) {
-        for (size_t j = 0; j < batches[i].len; j++) {
-            ok = do_hook_addr(hooks, hooks_len, (uintptr_t)batches[i].addrs[j],
-                              (uintptr_t)batches[i].callback, (uintptr_t*)batches[i].backup) && ok;
-        }
-    }
-    for (size_t i = 0; i < batches_len; i++) free(batches[i].addrs);
-    free(batches);
-    return ok;
+static void er_stealth_trampoline_patch(uintptr_t addr, uintptr_t cb, uintptr_t* out_orig) {
+#if defined(__aarch64__)
+    if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
+    uintptr_t page = addr & ~(k_page_size - 1);
+    mprotect((void*)page, k_page_size, PROT_READ | PROT_WRITE);
+    uintptr_t orig = *(uintptr_t*)addr;
+    if (out_orig) *out_orig = orig;
+    *(uintptr_t*)addr = cb;
+    __asm__ volatile(
+        "dc cvau, %0\n\t"
+        "dsb ish\n\t"
+        "ic ivau, %0\n\t"
+        "dsb ish\n\t"
+        "isb"
+        :: "r"(addr) : "memory"
+    );
+    mprotect((void*)page, k_page_size, PROT_READ);
+#else
+    er_stealth_direct_patch(addr, cb, out_orig);
+#endif
 }
 
 static bool do_hook_addr(HookInfo* hooks, size_t hooks_len, uintptr_t addr, uintptr_t cb, uintptr_t* bk) {
@@ -738,6 +856,40 @@ static bool do_hook_addr(HookInfo* hooks, size_t hooks_len, uintptr_t addr, uint
     }
     if (!info) { LOGE("no hook info for %p", (void*)addr); return false; }
     size_t len = info->map.end - info->map.start;
+
+    if (g_stealth_level == ErStealthLevel::DIRECT_PATCH) {
+        uintptr_t orig = 0;
+        er_stealth_direct_patch(addr, cb, &orig);
+        if (bk) *bk = orig;
+        ssize_t idx = -1;
+        for (size_t i = 0; i < info->entries_len; i++) {
+            if (info->entries[i].addr == addr) { idx = (ssize_t)i; break; }
+        }
+        if (idx != -1) {
+            if (cb == info->entries[idx].backup) {
+                info->entries_len--;
+                if ((size_t)idx < info->entries_len)
+                    memmove(&info->entries[idx], &info->entries[idx + 1], (info->entries_len - (size_t)idx) * sizeof(HookEntry));
+            }
+        } else {
+            HookEntry* tmp = (HookEntry*)realloc(info->entries, (info->entries_len + 1) * sizeof(HookEntry));
+            if (!tmp) { LOGE("OOM hook entries"); return false; }
+            info->entries = tmp;
+            info->entries[info->entries_len++] = { addr, orig };
+        }
+        return true;
+    }
+
+    if (g_stealth_level == ErStealthLevel::TRAMPOLINE) {
+        uintptr_t orig = 0;
+        er_stealth_trampoline_patch(addr, cb, &orig);
+        if (bk) *bk = orig;
+        HookEntry* tmp = (HookEntry*)realloc(info->entries, (info->entries_len + 1) * sizeof(HookEntry));
+        if (!tmp) { LOGE("OOM hook entries trampoline"); return false; }
+        info->entries = tmp;
+        info->entries[info->entries_len++] = { addr, orig };
+        return true;
+    }
 
     if (!info->backup_region && !info->self) {
 #ifdef __LP64__
@@ -759,7 +911,7 @@ static bool do_hook_addr(HookInfo* hooks, size_t hooks_len, uintptr_t addr, uint
             if (restore == MAP_FAILED || restore != (void*)info->map.start) return false;
             LOGE("mmap original fail"); return false;
         }
-        lsplt_memcpy((void*)info->map.start, baddr, len);
+        redirector_memcpy((void*)info->map.start, baddr, len);
         info->backup_region = (uintptr_t)baddr;
     }
 
@@ -805,79 +957,176 @@ static bool do_hook_addr(HookInfo* hooks, size_t hooks_len, uintptr_t addr, uint
 }
 
 static bool register_hook_internal(dev_t dev, ino_t inode, uintptr_t offset, size_t size,
-                                   const char* symbol, bool is_prefix, void* callback, void** backup) {
+                                   const char* symbol, bool is_prefix, bool is_got,
+                                   void* callback, void** backup) {
     if (!dev || !inode || !symbol || !symbol[0] || !callback) {
         LOGE("register_hook invalid params: dev=%lu inode=%lu sym=%s cb=%p",
              (unsigned long)dev, (unsigned long)inode, symbol ? symbol : "NULL", callback);
         return false;
     }
-    pthread_mutex_lock(&g_mutex);
+    std::lock_guard<std::mutex> lk(g_mutex);
     RegisterInfo* tmp = (RegisterInfo*)realloc(g_regs, (g_regs_len + 1) * sizeof(RegisterInfo));
-    if (!tmp) { PLOGE("realloc regs"); pthread_mutex_unlock(&g_mutex); return false; }
+    if (!tmp) { PLOGE("realloc regs"); return false; }
     g_regs = tmp;
     RegisterInfo* n = &g_regs[g_regs_len];
     n->symbol = strdup(symbol);
-    if (!n->symbol) {
-        LOGE("strdup symbol fail");
-        pthread_mutex_unlock(&g_mutex);
-        return false;
-    }
+    if (!n->symbol) { LOGE("strdup symbol fail"); return false; }
     n->dev = dev; n->inode = inode;
     n->offset_start = offset; n->offset_end = offset + size;
     n->is_prefix = is_prefix;
+    n->is_got    = is_got;
     n->callback  = callback; n->backup = backup;
     g_regs_len++;
-    pthread_mutex_unlock(&g_mutex);
-    LOGV("RegisterHook inode=%lu sym=%s%s", (unsigned long)inode, n->symbol, is_prefix ? " (prefix)" : "");
+    LOGV("RegisterHook inode=%lu sym=%s%s%s", (unsigned long)inode, n->symbol,
+         is_prefix ? " (prefix)" : "", is_got ? " (GOT)" : "");
     return true;
 }
 
-bool lsplt_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup) {
-    return register_hook_internal(dev, inode, 0, UINTPTR_MAX, symbol, false, callback, backup);
+bool redirector_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup) {
+    return register_hook_internal(dev, inode, 0, UINTPTR_MAX, symbol, false, false, callback, backup);
 }
 
-bool lsplt_register_hook_by_prefix(dev_t dev, ino_t inode, const char* prefix, void* callback, void** backup) {
-    return register_hook_internal(dev, inode, 0, UINTPTR_MAX, prefix, true, callback, backup);
+bool redirector_register_hook_by_prefix(dev_t dev, ino_t inode, const char* prefix, void* callback, void** backup) {
+    return register_hook_internal(dev, inode, 0, UINTPTR_MAX, prefix, true, false, callback, backup);
 }
 
-bool lsplt_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size,
-                                     const char* symbol, void* callback, void** backup) {
-    return register_hook_internal(dev, inode, offset, size, symbol, false, callback, backup);
+bool redirector_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size,
+                                          const char* symbol, void* callback, void** backup) {
+    return register_hook_internal(dev, inode, offset, size, symbol, false, false, callback, backup);
 }
 
-bool lsplt_commit_hook_manual(MapInfo* maps) {
-    pthread_mutex_lock(&g_mutex);
-    if (!g_regs_len) { pthread_mutex_unlock(&g_mutex); return true; }
+bool redirector_register_got_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup) {
+    return register_hook_internal(dev, inode, 0, UINTPTR_MAX, symbol, false, true, callback, backup);
+}
+
+bool er_set_stealth_level(ErStealthLevel level) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_stealth_level = level;
+    return true;
+}
+
+static bool do_hooks_for_all(HookInfo* hooks, size_t hooks_len) {
+    bool         ok       = true;
+    SymAddrBatch* batches = nullptr;
+    size_t        batches_len = 0;
+
+    for (size_t i = 0; i < hooks_len; i++) {
+        HookInfo* h = &hooks[i];
+        for (size_t j = 0; j < g_regs_len; j++) {
+            RegisterInfo* reg = &g_regs[j];
+            if (!reg->symbol) continue;
+            if (h->map.offset != reg->offset_start || !hook_info_matches(h, reg)) continue;
+
+            bool restore = false;
+            if (g_hooks) for (size_t k = 0; k < g_hooks_len; k++) {
+                for (size_t l = 0; l < g_hooks[k].entries_len; l++) {
+                    if (g_hooks[k].entries[l].backup == (uintptr_t)reg->callback) {
+                        restore = true;
+                        ok = do_hook_addr(hooks, hooks_len, g_hooks[k].entries[l].addr, g_hooks[k].entries[l].backup, nullptr) && ok;
+                        break;
+                    }
+                }
+            }
+
+            if (!h->elf.base_addr_ && !restore) elfutil_init(&h->elf, h->map.start);
+            if (h->elf.valid_ && !restore) {
+                if (h->elf.relro_active_) {
+                    uintptr_t page = h->map.start & ~(k_page_size - 1);
+                    mprotect((void*)page, h->map.end - page, PROT_READ | PROT_WRITE);
+                }
+                uintptr_t* addrs = nullptr;
+                size_t     addrs_len;
+                if (!reg->is_prefix) addrs_len = elfutil_find_plt_addr(&h->elf, reg->symbol, &addrs);
+                else                 addrs_len = elfutil_find_plt_addr_by_prefix(&h->elf, reg->symbol, &addrs);
+                if (!addrs_len) {
+                    LOGE("PLT addr not found: %s in %s", reg->symbol, h->map.path);
+                    ok = false; free(addrs); free(reg->symbol); reg->symbol = nullptr;
+                    goto next_reg;
+                }
+                SymAddrBatch* tmp = (SymAddrBatch*)realloc(batches, (batches_len + 1) * sizeof(SymAddrBatch));
+                if (!tmp) { PLOGE("realloc batches"); ok = false; free(addrs); free(reg->symbol); reg->symbol = nullptr; goto next_reg; }
+                batches = tmp;
+                batches[batches_len++] = { (void**)addrs, addrs_len, reg->callback, reg->backup };
+            }
+            free(reg->symbol); reg->symbol = nullptr;
+            continue;
+        next_reg:;
+        }
+    }
+
+    if (ok) for (size_t i = 0; i < batches_len; i++) {
+        for (size_t j = 0; j < batches[i].len; j++) {
+            ok = do_hook_addr(hooks, hooks_len, (uintptr_t)batches[i].addrs[j],
+                              (uintptr_t)batches[i].callback, (uintptr_t*)batches[i].backup) && ok;
+        }
+    }
+    for (size_t i = 0; i < batches_len; i++) free(batches[i].addrs);
+    free(batches);
+    return ok;
+}
+
+bool redirector_commit_hook_manual(MapInfo* maps) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_regs_len) return true;
 
     size_t    new_len = 0;
     HookInfo* new_arr = build_hook_infos(maps, &new_len);
-    if (!new_arr) { LOGE("build_hook_infos fail"); pthread_mutex_unlock(&g_mutex); return false; }
+    if (!new_arr) { LOGE("build_hook_infos fail"); return false; }
     if (!filter_hook_infos(new_arr, &new_len)) {
         LOGE("no hooks matched");
-        free_hooks(new_arr, new_len); pthread_mutex_unlock(&g_mutex); return false;
+        free_hooks(new_arr, new_len); return false;
     }
     if (g_hooks && !merge_hook_infos(&new_arr, &new_len, g_hooks, g_hooks_len)) {
         LOGE("merge fail");
-        free_hooks(new_arr, new_len); pthread_mutex_unlock(&g_mutex); return false;
+        free_hooks(new_arr, new_len); return false;
     }
     bool result = do_hooks_for_all(new_arr, new_len);
     if (g_hooks) free_hooks(g_hooks, g_hooks_len);
     g_hooks = new_arr; g_hooks_len = new_len;
-    pthread_mutex_unlock(&g_mutex);
     return result;
 }
 
-bool lsplt_commit_hook() {
-    MapInfo* maps = lsplt_scan_maps("self");
+bool redirector_commit_hook() {
+    MapInfo* maps = redirector_scan_maps("self");
     if (!maps) { LOGE("scan_maps fail"); return false; }
-    bool r = lsplt_commit_hook_manual(maps);
-    lsplt_free_maps(maps);
+    bool r = redirector_commit_hook_manual(maps);
+    redirector_free_maps(maps);
     return r;
 }
 
+bool redirector_unhook(dev_t dev, ino_t inode, const char* symbol) {
+    if (!symbol || !symbol[0]) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_hooks) return false;
+    bool restored = false;
+    for (size_t i = 0; i < g_hooks_len; i++) {
+        HookInfo* h = &g_hooks[i];
+        if (h->map.dev != dev || h->map.inode != inode) continue;
+        for (size_t j = 0; j < h->entries_len; j++) {
+            uintptr_t addr = h->entries[j].addr;
+            uintptr_t bk   = h->entries[j].backup;
+            if (g_stealth_level == ErStealthLevel::DIRECT_PATCH ||
+                g_stealth_level == ErStealthLevel::TRAMPOLINE) {
+                er_stealth_direct_patch(addr, bk, nullptr);
+            } else {
+                uintptr_t page = addr & ~(k_page_size - 1);
+                mprotect((void*)page, k_page_size, PROT_READ | PROT_WRITE);
+                *(uintptr_t*)addr = bk;
+                __builtin___clear_cache(page_start(addr), page_end(addr));
+                mprotect((void*)page, k_page_size, PROT_READ);
+            }
+            restored = true;
+        }
+        free(h->entries);
+        h->entries     = nullptr;
+        h->entries_len = 0;
+    }
+    return restored;
+}
+
 bool invalidate_backups() {
-    pthread_mutex_lock(&g_mutex);
-    if (!g_hooks) { pthread_mutex_unlock(&g_mutex); return true; }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_hooks) return true;
     bool res = true;
     for (size_t i = 0; i < g_hooks_len; i++) {
         HookInfo* h = &g_hooks[i];
@@ -897,17 +1146,43 @@ bool invalidate_backups() {
         }
         h->backup_region = 0;
     }
-    pthread_mutex_unlock(&g_mutex);
     return res;
 }
 
-void lsplt_free_resources() {
-    pthread_mutex_lock(&g_mutex);
+void redirector_free_resources() {
+    std::lock_guard<std::mutex> lk(g_mutex);
     if (g_hooks) { free_hooks(g_hooks, g_hooks_len); g_hooks = nullptr; g_hooks_len = 0; }
     if (g_regs) {
         for (size_t i = 0; i < g_regs_len; i++) if (g_regs[i].symbol) free(g_regs[i].symbol);
         free(g_regs); g_regs = nullptr; g_regs_len = 0;
     }
-    pthread_mutex_unlock(&g_mutex);
-    LOGV("lsplt freed");
+    g_sym_cache.clear();
+    if (g_cleanup_cb) {
+        g_cleanup_cb();
+        g_cleanup_cb = nullptr;
+    }
+    LOGV("redirector freed");
+}
+
+void er_set_cleanup_callback(ErCleanupCallback cb) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_cleanup_cb = std::move(cb);
+}
+
+bool er_init_for_zygisk() {
+    g_zygisk_mode.store(true, std::memory_order_release);
+    er_set_stealth_level(ErStealthLevel::DIRECT_PATCH);
+    if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
+    LOGV("er_init_for_zygisk: stealth=DIRECT_PATCH pagesize=%zu", (size_t)k_page_size);
+    return true;
+}
+
+static void er_atexit_handler() {
+    redirector_free_resources();
+}
+
+__attribute__((constructor))
+static void er_lib_init() {
+    atexit(er_atexit_handler);
+    if (!k_page_size) k_page_size = (uintptr_t)getpagesize();
 }

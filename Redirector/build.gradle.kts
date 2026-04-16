@@ -12,7 +12,7 @@ android {
     compileSdk        = androidCompileSdkVersion
     ndkVersion        = androidNdkVersion
     buildToolsVersion = androidBuildToolsVersion
-    namespace         = "com.eaquel.redirector"
+    namespace         = "io.github.eaquel.redirector"
 
     sourceSets {
         getByName("main") {
@@ -22,8 +22,8 @@ android {
 
     buildFeatures {
         buildConfig      = false
-        prefabPublishing = true
         prefab           = true
+        prefabPublishing = true
     }
 
     androidResources {
@@ -31,11 +31,11 @@ android {
     }
 
     packaging {
-        jniLibs { excludes += "**.so" }
+        jniLibs { excludes += "**/*.so" }
     }
 
     prefab {
-        register("Redirector") {
+        register("eaquel_redirector") {
             headers = "Source/Main/Bridge"
         }
     }
@@ -49,41 +49,51 @@ android {
         targetCompatibility = JavaVersion.VERSION_21
     }
 
+    externalNativeBuild {
+        cmake {
+            path    = file("Source/Main/Bridge/CMakeLists.txt")
+            version = androidCmakeVersion
+        }
+    }
+
     buildTypes {
         all {
             externalNativeBuild {
                 cmake {
                     abiFilters("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-                    val flags = arrayOf(
+                    
+                    val commonFlags = arrayOf(
                         "-Wall", "-Werror", "-Qunused-arguments",
-                        "-Wno-gnu-string-literal-operator-template",
-                        "-fno-rtti", "-fvisibility=hidden", "-fvisibility-inlines-hidden",
-                        "-fno-exceptions", "-fno-stack-protector", "-fomit-frame-pointer",
-                        "-Wno-builtin-macro-redefined", "-ffunction-sections", "-fdata-sections",
-                        "-Wno-unused-value", "-D__FILE__=__FILE_NAME__", "-Wl,--exclude-libs,ALL",
+                        "-fvisibility=hidden", "-fvisibility-inlines-hidden",
+                        "-fno-exceptions", "-fno-rtti",
+                        "-ffunction-sections", "-fdata-sections",
+                        "-fomit-frame-pointer", "-fstack-protector-strong",
+                        "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__"
                     )
-                    cppFlags("-std=c++23", *flags)
-                    val configFlags = arrayOf("-Oz", "-DNDEBUG").joinToString(" ")
+                    
+                    cppFlags("-std=c++23", *commonFlags)
+                    
                     val buildDir = layout.buildDirectory.get().asFile.absolutePath
+                    val isLogDisabled = if (project.hasProperty("disableLogs")) "ON" else "OFF"
+                    
                     arguments(
-                        "-DCMAKE_CXX_FLAGS_RELEASE=$configFlags",
                         "-DDEBUG_SYMBOLS_PATH=$buildDir/symbols/$name",
-                        "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                        "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                        "-DREDIRECTOR_LOGGING_DISABLED=$isLogDisabled"
                     )
                 }
             }
         }
         release {
+            isMinifyEnabled = false
             externalNativeBuild {
                 cmake {
-                    val flags = arrayOf(
-                        "-Wl,--gc-sections",
-                        "-flto",
-                        "-fno-unwind-tables",
-                        "-fno-asynchronous-unwind-tables"
+                    val releaseFlags = arrayOf("-Wl,--gc-sections", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables")
+                    cppFlags(*releaseFlags)
+                    arguments(
+                        "-DCMAKE_BUILD_TYPE=Release",
+                        "-DCMAKE_CXX_FLAGS_RELEASE=-Oz -DNDEBUG -flto"
                     )
-                    cppFlags += flags
-                    arguments += "-DCMAKE_BUILD_TYPE=Release"
                 }
             }
         }
@@ -91,15 +101,7 @@ android {
             initWith(getByName("release"))
             externalNativeBuild {
                 cmake {
-                    val flags = arrayOf(
-                        "-Wl,--gc-sections",
-                        "-flto",
-                        "-fno-unwind-tables",
-                        "-fno-asynchronous-unwind-tables"
-                    )
-                    cppFlags += flags
                     arguments += "-DANDROID_STL=none"
-                    arguments += "-DCMAKE_BUILD_TYPE=Release"
                 }
             }
         }
@@ -108,12 +110,5 @@ android {
     lint {
         abortOnError       = true
         checkReleaseBuilds = false
-    }
-
-    externalNativeBuild {
-        cmake {
-            path    = file("Source/Main/Bridge/CMakeLists.txt")
-            version = androidCmakeVersion
-        }
     }
 }

@@ -1,5 +1,12 @@
 #pragma once
 
+#define EAQUEL_REDIRECTOR_VERSION "1.0.0-2026"
+
+#ifdef LOG_TAG
+#undef LOG_TAG
+#endif
+#define LOG_TAG "Eaquel_Redirector"
+
 #include <android/log.h>
 #include <errno.h>
 #include <link.h>
@@ -11,12 +18,15 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <span>
+#include <mutex>
+#include <optional>
+#include <string_view>
+#include <atomic>
+#include <functional>
+#include <unordered_map>
 
-#ifndef LOG_TAG
-#define LOG_TAG "LSPlt"
-#endif
-
-#ifdef LOG_DISABLED
+#ifdef ER_LOG_DISABLED
 #define LOGD(...) ((void)0)
 #define LOGV(...) ((void)0)
 #define LOGI(...) ((void)0)
@@ -57,10 +67,15 @@
 
 static uintptr_t k_page_size = 0;
 
+enum class ErStealthLevel : uint8_t {
+    DIRECT_PATCH = 1,
+    TRAMPOLINE   = 2,
+    BACKUP_FULL  = 3
+};
+
 [[gnu::always_inline]] static inline void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
     if (k_page_size == 0) k_page_size = static_cast<uintptr_t>(getpagesize());
     if (offset % static_cast<off_t>(k_page_size) != 0) { errno = EINVAL; return MAP_FAILED; }
-
     void* result;
 #if defined(__arm__)
     register long r0 __asm__("r0") = (long)addr;
@@ -98,10 +113,15 @@ static uintptr_t k_page_size = 0;
     __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "cc", "memory");
     result = (void*)rax;
 #elif defined(__riscv)
-    __asm__ volatile("mv a0,%[addr]\nmv a1,%[len]\nmv a2,%[prot]\nmv a3,%[flags]\nmv a4,%[fd]\nmv a5,%[off]\nli a7,%[nr]\necall"
-        : "=r"(result)
-        : [addr]"0"(addr), [len]"r"(length), [prot]"r"(prot), [flags]"r"(flags), [fd]"r"(fd), [off]"r"(offset), [nr]"i"(SYS_mmap)
-        : "a1", "a2", "a3", "a4", "a5", "a7", "cc", "memory");
+    register long a0 __asm__("a0") = (long)addr;
+    register long a1 __asm__("a1") = (long)length;
+    register long a2 __asm__("a2") = (long)prot;
+    register long a3 __asm__("a3") = (long)flags;
+    register long a4 __asm__("a4") = (long)fd;
+    register long a5 __asm__("a5") = (long)offset;
+    register long a7 __asm__("a7") = SYS_mmap;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7) : "memory");
+    result = (void*)a0;
 #endif
     CHECK_SYSCALL_ERROR(result);
     return result;
@@ -141,10 +161,14 @@ static uintptr_t k_page_size = 0;
     __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "cc", "memory");
     result = (void*)rax;
 #elif defined(__riscv)
-    __asm__ volatile("mv a0,%[old]\nmv a1,%[osz]\nmv a2,%[nsz]\nmv a3,%[flg]\nmv a4,%[new]\nli a7,%[nr]\necall"
-        : "=r"(result)
-        : [old]"0"(old_address), [osz]"r"(old_size), [nsz]"r"(new_size), [flg]"r"(flags), [new]"r"(new_address), [nr]"i"(SYS_mremap)
-        : "a1", "a2", "a3", "a4", "a7", "cc", "memory");
+    register long a0 __asm__("a0") = (long)old_address;
+    register long a1 __asm__("a1") = (long)old_size;
+    register long a2 __asm__("a2") = (long)new_size;
+    register long a3 __asm__("a3") = (long)flags;
+    register long a4 __asm__("a4") = (long)new_address;
+    register long a7 __asm__("a7") = SYS_mremap;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+    result = (void*)a0;
 #endif
     CHECK_SYSCALL_ERROR(result);
     return result;
@@ -174,47 +198,78 @@ static uintptr_t k_page_size = 0;
     __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi) : "rcx", "r11", "cc", "memory");
     result = rax;
 #elif defined(__riscv)
-    __asm__ volatile("mv a1, %[len]\nli a7, %[nr]\necall"
-        : "=r"(result) : "0"(addr), [len]"r"(length), [nr]"i"(SYS_munmap) : "a1", "a7", "cc", "memory");
+    register long a0 __asm__("a0") = (long)addr;
+    register long a1 __asm__("a1") = (long)length;
+    register long a7 __asm__("a7") = SYS_munmap;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    result = a0;
 #endif
     CHECK_SYSCALL_ERROR_INTEGER(result);
     return (int)result;
 }
 
+template<long NR, typename... Args>
+[[gnu::always_inline]] static inline long er_syscall(Args... args) {
+    long result;
+#if defined(__aarch64__)
+    long a[8] = { (long)args..., 0, 0, 0, 0, 0, 0, 0 };
+    register long x0 __asm__("x0") = a[0];
+    register long x1 __asm__("x1") = a[1];
+    register long x2 __asm__("x2") = a[2];
+    register long x3 __asm__("x3") = a[3];
+    register long x4 __asm__("x4") = a[4];
+    register long x5 __asm__("x5") = a[5];
+    register long x8 __asm__("x8") = NR;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8) : "cc", "memory");
+    result = x0;
+#elif defined(__x86_64__)
+    result = syscall(NR, args...);
+#elif defined(__arm__)
+    result = syscall(NR, args...);
+#elif defined(__riscv)
+    result = syscall(NR, args...);
+#else
+    result = syscall(NR, args...);
+#endif
+    return result;
+}
+
 struct ElfInfo {
-    ElfW(Addr) base_addr_;
-    ElfW(Addr) bias_addr_;
-    ElfW(Ehdr)* header_;
-    ElfW(Phdr)* program_header_;
-    ElfW(Dyn)*  dynamic_;
-    ElfW(Word)  dynamic_size_;
-    const char* dyn_str_;
-    ElfW(Sym)*  dyn_sym_;
-    ElfW(Word)  dyn_str_size_;
-    ElfW(Addr)  relr_;
-    ElfW(Word)  relr_size_;
-    ElfW(Word)  relr_entry_size_;
-    ElfW(Addr)  rel_plt_;
-    ElfW(Word)  rel_plt_size_;
-    ElfW(Addr)  rel_dyn_;
-    ElfW(Word)  rel_dyn_size_;
-    ElfW(Addr)  rel_android_;
-    ElfW(Word)  rel_android_size_;
-    uint32_t*   bucket_;
-    uint32_t    bucket_count_;
-    uint32_t*   chain_;
-    uint32_t    sym_offset_;
-    uint32_t    sym_count_;
-    ElfW(Addr)* bloom_;
-    uint32_t    bloom_size_;
-    uint32_t    bloom_shift_;
-    bool        rel_plt_is_rela_;
-    bool        rel_dyn_is_rela_;
-    bool        rel_android_is_rela_;
-    bool        valid_;
+    ElfW(Addr)              base_addr_;
+    ElfW(Addr)              bias_addr_;
+    ElfW(Ehdr)*             header_;
+    ElfW(Phdr)*             program_header_;
+    ElfW(Dyn)*              dynamic_;
+    ElfW(Word)              dynamic_size_;
+    const char*             dyn_str_;
+    ElfW(Sym)*              dyn_sym_;
+    ElfW(Word)              dyn_str_size_;
+    ElfW(Addr)              relr_;
+    ElfW(Word)              relr_size_;
+    ElfW(Word)              relr_entry_size_;
+    std::span<const ElfW(Addr)> relr_entries;
+    ElfW(Addr)              rel_plt_;
+    ElfW(Word)              rel_plt_size_;
+    ElfW(Addr)              rel_dyn_;
+    ElfW(Word)              rel_dyn_size_;
+    ElfW(Addr)              rel_android_;
+    ElfW(Word)              rel_android_size_;
+    uint32_t*               bucket_;
+    uint32_t                bucket_count_;
+    uint32_t*               chain_;
+    uint32_t                sym_offset_;
+    uint32_t                sym_count_;
+    ElfW(Addr)*             bloom_;
+    uint32_t                bloom_size_;
+    uint32_t                bloom_shift_;
+    bool                    rel_plt_is_rela_;
+    bool                    rel_dyn_is_rela_;
+    bool                    rel_android_is_rela_;
+    bool                    valid_;
+    bool                    relro_active_;
 };
 
-void elfutil_init(ElfInfo* elf, uintptr_t base_addr);
+void   elfutil_init(ElfInfo* elf, uintptr_t base_addr);
 size_t elfutil_find_plt_addr(const ElfInfo* elf, const char* name, uintptr_t** out_addrs);
 size_t elfutil_find_plt_addr_by_prefix(const ElfInfo* elf, const char* name_prefix, uintptr_t** out_addrs);
 
@@ -234,12 +289,19 @@ struct MapInfo {
     size_t    length;
 };
 
-MapInfo* lsplt_scan_maps(const char* pid);
-void     lsplt_free_maps(MapInfo* maps);
-bool     lsplt_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
-bool     lsplt_register_hook_by_prefix(dev_t dev, ino_t inode, const char* symbol_prefix, void* callback, void** backup);
-bool     lsplt_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size, const char* symbol, void* callback, void** backup);
-bool     lsplt_commit_hook_manual(MapInfo* maps);
-bool     lsplt_commit_hook();
-bool     invalidate_backups();
-void     lsplt_free_resources();
+using ErCleanupCallback = std::function<void()>;
+
+[[nodiscard]] MapInfo* redirector_scan_maps(const char* pid);
+void                   redirector_free_maps(MapInfo* maps);
+[[nodiscard]] bool     redirector_register_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
+[[nodiscard]] bool     redirector_register_hook_by_prefix(dev_t dev, ino_t inode, const char* symbol_prefix, void* callback, void** backup);
+[[nodiscard]] bool     redirector_register_hook_with_offset(dev_t dev, ino_t inode, uintptr_t offset, size_t size, const char* symbol, void* callback, void** backup);
+[[nodiscard]] bool     redirector_register_got_hook(dev_t dev, ino_t inode, const char* symbol, void* callback, void** backup);
+[[nodiscard]] bool     redirector_commit_hook_manual(MapInfo* maps);
+[[nodiscard]] bool     redirector_commit_hook();
+[[nodiscard]] bool     redirector_unhook(dev_t dev, ino_t inode, const char* symbol);
+[[nodiscard]] bool     er_set_stealth_level(ErStealthLevel level);
+[[nodiscard]] bool     invalidate_backups();
+void                   redirector_free_resources();
+void                   er_set_cleanup_callback(ErCleanupCallback cb);
+[[nodiscard]] bool     er_init_for_zygisk();
