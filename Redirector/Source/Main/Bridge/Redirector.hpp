@@ -212,7 +212,9 @@ template<long NR, typename... Args>
 [[gnu::always_inline]] static inline long er_syscall(Args... args) {
     long result;
 #if defined(__aarch64__)
-    long a[8] = { (long)args..., 0, 0, 0, 0, 0, 0, 0 };
+    static_assert(sizeof...(args) <= 6, "er_syscall: too many arguments (max 6)");
+    long a[6] = {};
+    { long tmp[] = { (long)args... }; for (size_t i = 0; i < sizeof...(args); i++) a[i] = tmp[i]; }
     register long x0 __asm__("x0") = a[0];
     register long x1 __asm__("x1") = a[1];
     register long x2 __asm__("x2") = a[2];

@@ -65,7 +65,7 @@ struct SymbolCacheKeyHash {
     size_t operator()(const SymbolCacheKey& k) const {
         size_t h1 = std::hash<std::string>{}(k.name);
         size_t h2 = std::hash<uintptr_t>{}(k.base);
-        return h1 ^ (h2 << 32) ^ (h2 >> 32);
+        return h1 ^ (size_t)((uint64_t)h2 << 32) ^ (size_t)((uint64_t)h2 >> 32);
     }
 };
 
@@ -813,13 +813,13 @@ static void er_stealth_direct_patch(uintptr_t addr, uintptr_t cb, uintptr_t* out
         :: "r"(addr) : "memory"
     );
 #elif defined(__arm__)
-    __builtin___clear_cache((void*)page, (void*)(page + k_page_size));
+    __builtin___clear_cache((char*)page, (char*)(page + k_page_size));
 #elif defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("" ::: "memory");
 #elif defined(__riscv)
     __asm__ volatile("fence.i" ::: "memory");
 #else
-    __builtin___clear_cache((void*)page, (void*)(page + k_page_size));
+    __builtin___clear_cache((char*)page, (char*)(page + k_page_size));
 #endif
     int restore_prot = cur_prot & ~PROT_WRITE;
     if (restore_prot == 0) restore_prot = PROT_READ;
