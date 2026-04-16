@@ -219,7 +219,7 @@ static bool elfutil_unpack_android_relocs(const ElfInfo* elf, AndroidRelocBuffer
                 r_addend += (uint32_t)sleb128_decode(&dec);
             if (elf->rel_android_is_rela_) {
                 ElfW(Rela)* rela = (ElfW(Rela)*)entries;
-                rela[out_idx] = { cur_off, ELF_R_INFO(sym_idx, type), (ElfW(Sxword))r_addend };
+                rela[out_idx] = { cur_off, ELF_R_INFO(sym_idx, type), static_cast<decltype(rela[0].r_addend)>(r_addend) };
             } else {
                 ElfW(Rel)* rel = (ElfW(Rel)*)entries;
                 rel[out_idx] = { cur_off, ELF_R_INFO(sym_idx, type) };
@@ -552,7 +552,7 @@ MapInfo* lsplt_scan_maps(const char* pid) {
             if (!tmp) { free(pstr); goto cleanup; }
             info->maps = tmp;
         }
-        info->maps[info->length++] = { start, end, pb, perms[3] == 'p', offset, makedev(dev_maj, dev_min), inode, pstr };
+        info->maps[info->length++] = { start, end, pb, perms[3] == 'p', offset, static_cast<dev_t>(makedev(dev_maj, dev_min)), inode, pstr };
         continue;
     cleanup:
         for (size_t i = 0; i < info->length; i++) free(info->maps[i].path);
