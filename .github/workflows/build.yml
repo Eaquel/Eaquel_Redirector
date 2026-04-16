@@ -6,11 +6,16 @@ on:
     paths-ignore:
       - 'README.md'
   pull_request:
+  workflow_dispatch:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build & Package
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,11 +28,11 @@ jobs:
         with:
           submodules: 'recursive'
           fetch-depth: 0
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
           cache: 'gradle'
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -41,139 +46,35 @@ jobs:
           ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
           ccache -p
           echo 'android.native.buildOutput=verbose' >> gradle.properties
-          ./gradlew :lsplt:publishToMavenLocal :lsplt:prefabDebugPackage
+          ./gradlew :Redirector:assembleDebug :Redirector:assembleRelease :Redirector:publishToMavenLocal
         env:
           ORG_GRADLE_PROJECT_signingKey: ${{ secrets.maven_pgp_signingKey }}
           ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.maven_pgp_signingPassword }}
-      - name: Upload library
+      - name: Upload AAR Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}-library
-          path: ~/.m2
+          name: ${{ matrix.os }}-binaries
+          path: Redirector/build/outputs/aar/
+          if-no-files-found: error
 
-  test:
+  deploy-docs:
+    name: Generate & Deploy Docs
     needs: build
-    name: Test on API ${{ matrix.api-level }} ${{ matrix.arch }}
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - api-level: 21
-            target: default
-            arch: x86_64
-          - api-level: 21
-            target: default
-            arch: x86
-          - api-level: 22
-            target: default
-            arch: x86_64
-          - api-level: 22
-            target: default
-            arch: x86
-          - api-level: 23
-            target: default
-            arch: x86_64
-          - api-level: 23
-            target: default
-            arch: x86
-          - api-level: 24
-            target: default
-            arch: x86_64
-          - api-level: 24
-            target: default
-            arch: x86
-          - api-level: 25
-            target: default
-            arch: x86_64
-          - api-level: 25
-            target: default
-            arch: x86
-          - api-level: 26
-            target: default
-            arch: x86_64
-          - api-level: 26
-            target: default
-            arch: x86
-          - api-level: 27
-            target: default
-            arch: x86_64
-          - api-level: 27
-            target: default
-            arch: x86
-          - api-level: 28
-            target: default
-            arch: x86_64
-          - api-level: 28
-            target: default
-            arch: x86
-          - api-level: 29
-            target: default
-            arch: x86_64
-          - api-level: 29
-            target: default
-            arch: x86
-          - api-level: 30
-            target: default
-            arch: x86_64
-          - api-level: 30
-            target: google_apis
-            arch: x86
-          - api-level: 31
-            target: default
-            arch: x86_64
-          - api-level: 31
-            target: android-tv
-            arch: x86
-          - api-level: 32
-            target: aosp_atd
-            arch: x86_64
-          - api-level: 33
-            target: aosp_atd
-            arch: x86_64
-          - api-level: 34
-            target: aosp_atd
-            arch: x86_64
     steps:
-      - name: checkout
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Install Doxygen
+        run: sudo apt-get update && sudo apt-get install -y doxygen
+      - name: Generate Documentation
+        run: doxygen docs/doxygen.cfg
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: ${{ runner.os }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}
-          save: false
-      - name: Enable KVM group perms
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: run tests
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api-level }}
-          arch: ${{ matrix.arch }}
-          target: ${{ matrix.target }}
-          script: |
-            ccache -o cache_dir=${{ github.workspace }}/.ccache
-            ccache -o hash_dir=false
-            ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
-            echo 'android.native.buildOutput=verbose' >> gradle.properties
-            ./gradlew :test:connectedCheck
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          avd-name: ${{ matrix.api-level }}_${{ matrix.arch }}
-      - name: Upload outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.api-level }}-${{ matrix.arch }}-test-outputs
-          path: test/build/outputs
+          path: 'docs/docs'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
