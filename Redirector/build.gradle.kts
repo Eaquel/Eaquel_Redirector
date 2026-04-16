@@ -1,7 +1,5 @@
 plugins {
     id("com.android.library")
-    id("maven-publish")
-    id("signing")
 }
 
 val androidTargetSdkVersion  : Int    by rootProject.extra
@@ -12,10 +10,10 @@ val androidNdkVersion        : String by rootProject.extra
 val androidCmakeVersion      : String by rootProject.extra
 
 android {
-    compileSdk       = androidCompileSdkVersion
-    ndkVersion       = androidNdkVersion
+    compileSdk        = androidCompileSdkVersion
+    ndkVersion        = androidNdkVersion
     buildToolsVersion = androidBuildToolsVersion
-    namespace        = "com.eaquel.redirector"
+    namespace         = "com.eaquel.redirector"
 
     sourceSets {
         getByName("main") {
@@ -24,10 +22,10 @@ android {
     }
 
     buildFeatures {
-        buildConfig        = false
-        prefabPublishing   = true
-        androidResources   = false
-        prefab             = true
+        buildConfig      = false
+        prefabPublishing = true
+        androidResources = false
+        prefab           = true
     }
 
     packaging {
@@ -107,8 +105,8 @@ android {
     }
 
     lint {
-        abortOnError         = true
-        checkReleaseBuilds   = false
+        abortOnError       = true
+        checkReleaseBuilds = false
     }
 
     externalNativeBuild {
@@ -117,97 +115,4 @@ android {
             version = androidCmakeVersion
         }
     }
-
-    publishing {
-        singleVariant("release")    { withSourcesJar(); withJavadocJar() }
-        singleVariant("standalone") { withSourcesJar(); withJavadocJar() }
-    }
-}
-
-val buildDir = layout.buildDirectory.get().asFile.absolutePath
-
-val symbolsReleaseTask = tasks.register<Jar>("generateReleaseSymbolsJar") {
-    from("$buildDir/symbols/release")
-    exclude("**/dex_builder")
-    archiveClassifier.set("symbols")
-    archiveBaseName.set("release")
-}
-
-val symbolsStandaloneTask = tasks.register<Jar>("generateStandaloneSymbolsJar") {
-    from("$buildDir/symbols/standalone")
-    exclude("**/dex_builder")
-    archiveClassifier.set("symbols")
-    archiveBaseName.set("standalone")
-}
-
-val ver: String = runCatching {
-    val proc = ProcessBuilder("git", "describe", "--tags", "--abbrev=0")
-        .directory(rootProject.projectDir)
-        .redirectErrorStream(true)
-        .start()
-    proc.inputStream.bufferedReader().readText().trim().removePrefix("v")
-        .takeIf { it.isNotBlank() } ?: "0.0"
-}.getOrDefault("0.0")
-
-publishing {
-    publications {
-        fun MavenPublication.setup() {
-            group   = "io.github.eaquel.redirector"
-            version = ver
-            pom {
-                name.set("Eaquel_Redirector")
-                description.set("PLT hook framework — Eaquel/Eaquel_Redirector")
-                url.set("https://github.com/Eaquel/Eaquel_Redirector")
-                licenses {
-                    license {
-                        name.set("Apache-2.0")
-                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
-                    }
-                }
-                developers {
-                    developer { name.set("Eaquel"); email.set("shakeofangel@gmail.com") }
-                }
-                scm {
-                    connection.set("scm:git:git://github.com/Eaquel/Eaquel_Redirector.git")
-                    url.set("https://github.com/Eaquel/Eaquel_Redirector")
-                }
-            }
-        }
-        register<MavenPublication>("Redirector") {
-            artifactId = "Redirector"
-            afterEvaluate {
-                from(components.getByName("release"))
-                artifact(symbolsReleaseTask)
-            }
-            setup()
-        }
-        register<MavenPublication>("RedirectorStandalone") {
-            artifactId = "Redirector-standalone"
-            afterEvaluate {
-                from(components.getByName("standalone"))
-                artifact(symbolsStandaloneTask)
-            }
-            setup()
-        }
-    }
-    repositories {
-        maven {
-            name = "GitHubPackages"
-            url  = uri("https://maven.pkg.github.com/Eaquel/Eaquel_Redirector")
-            credentials {
-                username = System.getenv("GITHUB_ACTOR")
-                password = System.getenv("GITHUB_TOKEN")
-            }
-        }
-        mavenLocal()
-    }
-}
-
-signing {
-    val signingKey      = findProperty("signingKey")      as String?
-    val signingPassword = findProperty("signingPassword") as String?
-    if (signingKey != null && signingPassword != null) {
-        useInMemoryPgpKeys(signingKey, signingPassword)
-    }
-    sign(publishing.publications)
 }
